@@ -41,7 +41,7 @@ LDFLAGS = -arch $(ARCHS) \
           -framework CFNetwork
 
 # 源文件
-SOURCES = SSLBypass.mm
+SOURCES = SSLBypass.mm fishhook.c
 OBJECTS = $(SOURCES:.mm=.o)
 
 # 输出

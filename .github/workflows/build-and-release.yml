@@ -111,9 +111,8 @@ jobs:
             -Xlinker -dead_strip \
             -framework Foundation \
             -framework Security \
-            -framework CFNetwork \
             -o SSLBypass-${{ matrix.arch }}.dylib \
-            SSLBypass.mm
+            SSLBypass.mm fishhook.c
 
           echo "::endgroup::"
 

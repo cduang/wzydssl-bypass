@@ -1,281 +1,201 @@
 /*
- * SSLBypass.mm - iOS SSL Pinning 底层绕过实现
+ * SSLBypass.mm - iOS SSL Pinning Bypass Dylib
  *
- * 原理: 使用 dlsym(RTLD_NEXT, ...) + C 函数指针替换
- * 在 C 函数级别 Hook Security.framework
+ * 多层绕过策略:
  *
- * 相比 fishhook / Method Swizzling，此方法更底层、更通用:
- *   - 不依赖 Mach-O 符号表解析
- *   - 对使用 NSURLSession / CFNetwork / WebView 的 App 全部有效
- *   - 兼容 iOS 14.0 - 17.x
+ * 第1层: fishhook (C函数级)
+ *   直接修改调用方 Mach-O 的 __la_symbol_ptr / __nl_symbol_ptr
+ *   将 Security.framework 函数指针替换为Hook函数
+ *   覆盖使用 NSURLSession / CFNetwork 的标准场景
  *
- * 编译方式:
+ * 第2层: Method Swizzling (ObjC级)
+ *   运行时扫描所有已加载的类，找到实现了
+ *   URLSession:task:didReceiveChallenge:completionHandler: 的类
+ *   替换其实现，强制放行服务器信任挑战
+ *   覆盖 App 自定义 NSURLSessionDelegate 的场景
+ *
+ * 第3层: 定时重扫 (动态加载)
+ *   App 可能延迟加载某些类/库
+ *   在 1s、3s、8s 后重新执行第2层的扫描
+ *
+ * 编译:
  *   clang++ -arch arm64 -miphoneos-version-min=14.0 \
  *           -isysroot $(xcrun -sdk iphoneos --show-sdk-path) \
  *           -fobjc-arc -O2 \
  *           -dynamiclib \
  *           -install_name @executable_path/SSLBypass.dylib \
- *           -framework Foundation -framework Security -framework CFNetwork \
- *           -o SSLBypass.dylib SSLBypass.mm
+ *           -framework Foundation -framework Security \
+ *           -o SSLBypass.dylib \
+ *           SSLBypass.mm fishhook.c
  */
 
 #import <Foundation/Foundation.h>
 #import <Security/Security.h>
-#import <dlfcn.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#import <mach-o/dyld.h>
-#import <mach-o/loader.h>
-#import <mach-o/nlist.h>
+#import "fishhook.h"
 
-// ============================================================
-// 原始函数指针声明
-// ============================================================
+#pragma mark - 原始函数指针
 
-// Security.framework 核心函数
-static OSStatus (*orig_SecTrustEvaluate)(SecTrustRef trust, SecTrustResultType *result);
-static OSStatus (*orig_SecTrustEvaluateAsync)(SecTrustRef trust, dispatch_queue_t queue, SecTrustCallback result);
-static SecTrustRef (*orig_SecTrustCreateWithCertificates)(CFArrayRef certificates, CFTypeRef policies);
+static OSStatus (*orig_SecTrustEvaluate)(SecTrustRef, SecTrustResultType *);
+static OSStatus (*orig_SecTrustEvaluateAsync)(SecTrustRef, dispatch_queue_t, SecTrustCallback);
+static SecTrustRef (*orig_SecTrustCreateWithCertificates)(CFArrayRef, CFTypeRef);
 
+#pragma mark - 第1层: C函数 Hook
 
-// ============================================================
-// 使用 DYLD_INTERPOSE 宏实现函数拦截 (Apple 官方支持的机制)
-// 原理: 通过 __DATA,__interpose section 注册符号替换
-// 这是最底层、最可靠的 iOS C 函数 Hook 方式
-// ============================================================
-
-#pragma mark - SecTrustEvaluate Hook
-
-/*
- * SecTrustEvaluate: 同步证书验证
- * 
- * 原始行为: 验证服务器证书链是否受信任
- * Hook 行为: 始终返回 kSecTrustResultProceed (信任通过)
- * 
- * 参数:
- *   trust  - 待验证的 SecTrust 对象 (包含证书链)
- *   result - 输出参数，返回验证结果
- */
-static OSStatus hooked_SecTrustEvaluate(SecTrustRef trust, SecTrustResultType *result) {
-    if (result != NULL) {
-        *result = kSecTrustResultProceed;
-    }
-    NSLog(@"[SSLBypass] 🔓 SecTrustEvaluate 绕过 (证书链已验证为信任)");
+static OSStatus hook_SecTrustEvaluate(SecTrustRef trust, SecTrustResultType *result) {
+    if (result) *result = kSecTrustResultProceed;
+    NSLog(@"[SSLBypass][L1] 🔓 SecTrustEvaluate bypassed");
     return errSecSuccess;
 }
 
-#pragma mark - SecTrustEvaluateAsync Hook
-
-/*
- * SecTrustEvaluateAsync: 异步证书验证
- * 
- * 原始行为: 异步验证证书链，通过回调返回结果
- * Hook 行为: 立即通过 dispatch_async 回调返回 kSecTrustResultProceed
- */
-static OSStatus hooked_SecTrustEvaluateAsync(SecTrustRef trust,
-                                              dispatch_queue_t queue,
-                                              SecTrustCallback result) {
-    if (result != NULL) {
-        dispatch_async(queue ? queue : dispatch_get_main_queue(), ^{
-            result(trust, kSecTrustResultProceed);
+static OSStatus hook_SecTrustEvaluateAsync(SecTrustRef trust,
+                                            dispatch_queue_t queue,
+                                            SecTrustCallback callback) {
+    if (callback) {
+        dispatch_async(queue ?: dispatch_get_main_queue(), ^{
+            callback(trust, kSecTrustResultProceed);
         });
     }
-    NSLog(@"[SSLBypass] 🔓 SecTrustEvaluateAsync 绕过");
+    NSLog(@"[SSLBypass][L1] 🔓 SecTrustEvaluateAsync bypassed");
     return errSecSuccess;
 }
 
-#pragma mark - SecTrustCreateWithCertificates Hook
-
-/*
- * SecTrustCreateWithCertificates: 创建证书信任对象
- * 
- * 原始行为: 用指定证书和策略创建信任对象
- * Hook 行为: 透传调用原始函数，不做额外限制
- */
-static SecTrustRef hooked_SecTrustCreateWithCertificates(CFArrayRef certificates,
-                                                          CFTypeRef policies) {
-    if (orig_SecTrustCreateWithCertificates) {
-        return orig_SecTrustCreateWithCertificates(certificates, policies);
-    }
+static SecTrustRef hook_SecTrustCreateWithCertificates(CFArrayRef certs, CFTypeRef policies) {
+    if (orig_SecTrustCreateWithCertificates)
+        return orig_SecTrustCreateWithCertificates(certs, policies);
     return NULL;
 }
 
-
-// ============================================================
-// DYLD_INTERPOSE 注册表
-// 告诉 dyld 在加载时自动替换这些符号
-// ============================================================
-
-/*
- * interpose 结构体:
- *   - 第一个成员: 替换后的函数指针 (我们的 Hook)
- *   - 第二个成员: 被替换的原始函数指针
- */
-__attribute__((used)) static struct interpose_section {
-    const void *replacement;
-    const void *original;
-} interpose_table[] __attribute__((section("__DATA,__interpose"))) = {
-    { (const void *)hooked_SecTrustEvaluate,            (const void *)SecTrustEvaluate },
-    { (const void *)hooked_SecTrustEvaluateAsync,       (const void *)SecTrustEvaluateAsync },
-    { (const void *)hooked_SecTrustCreateWithCertificates, (const void *)SecTrustCreateWithCertificates },
-};
-
-
-// ============================================================
-// 备用方案: 如果 DYLD_INTERPOSE 不起作用，通过 dlsym 手动注入
-// 在构造函数中主动查找并保存原始函数指针
-// ============================================================
-
-static void initOriginalPointers() {
-    // 从 Security.framework 中获取原始函数指针
-    // 注意: RTLD_NEXT 会找到"下一个"定义，即 Security.framework 中的真实实现
-    orig_SecTrustEvaluate = (OSStatus (*)(SecTrustRef, SecTrustResultType *))
-        dlsym(RTLD_NEXT, "SecTrustEvaluate");
-    orig_SecTrustEvaluateAsync = (OSStatus (*)(SecTrustRef, dispatch_queue_t, SecTrustCallback))
-        dlsym(RTLD_NEXT, "SecTrustEvaluateAsync");
-    orig_SecTrustCreateWithCertificates = (SecTrustRef (*)(CFArrayRef, CFTypeRef))
-        dlsym(RTLD_NEXT, "SecTrustCreateWithCertificates");
+/// 注册 fishhook，替换 Security.framework 符号指针
+static void hook_security_functions() {
+    struct fishhook_rebinding rebindings[] = {
+        {"SecTrustEvaluate",             hook_SecTrustEvaluate,             (void **)&orig_SecTrustEvaluate},
+        {"SecTrustEvaluateAsync",        hook_SecTrustEvaluateAsync,        (void **)&orig_SecTrustEvaluateAsync},
+        {"SecTrustCreateWithCertificates", hook_SecTrustCreateWithCertificates, (void **)&orig_SecTrustCreateWithCertificates},
+    };
     
-    if (orig_SecTrustEvaluate == NULL) {
-        NSLog(@"[SSLBypass] ⚠️ dlsym 未找到 SecTrustEvaluate，尝试从 Security 库加载");
-        void *handle = dlopen("/System/Library/Frameworks/Security.framework/Security", RTLD_LAZY);
-        if (handle) {
-            orig_SecTrustEvaluate = (OSStatus (*)(SecTrustRef, SecTrustResultType *))
-                dlsym(handle, "SecTrustEvaluate");
-            orig_SecTrustEvaluateAsync = (OSStatus (*)(SecTrustRef, dispatch_queue_t, SecTrustCallback))
-                dlsym(handle, "SecTrustEvaluateAsync");
-            orig_SecTrustCreateWithCertificates = (SecTrustRef (*)(CFArrayRef, CFTypeRef))
-                dlsym(handle, "SecTrustCreateWithCertificates");
-            dlclose(handle);
-        }
-    }
+    int r = fishhook_rebind_symbols(rebindings, sizeof(rebindings)/sizeof(rebindings[0]));
+    NSLog(@"[SSLBypass][L1] fishhook rebind: %d (0=success)", r);
 }
 
+#pragma mark - 第2层: ObjC Method Swizzling
 
-// ============================================================
-// NSURLSessionDelegate 方法交换 (ObjC 层补充)
-// 对于没有使用 Security.framework 的某些私有网络框架
-// ============================================================
-
-/*
- * 通用的 NSURLSession 认证挑战处理交换实现
- * 当 NSURLSessionDelegate 收到服务器信任挑战时:
- *   - 自动创建信任凭证 (credentialForTrust:)
- *   - 调用 completionHandler 传入凭证，绕过证书校验
- */
-static void URLSession_didReceiveChallenge_swizzle(
-    id __unused self,
-    SEL __unused _cmd,
-    NSURLSession * __unused session,
-    NSURLSessionTask * __unused task,
-    NSURLAuthenticationChallenge *challenge,
-    void (^completionHandler)(NSURLSessionAuthChallengeDisposition, NSURLCredential *)) {
+/// 通用的 challenge 处理函数 (会被替换到各个 delegate 类中)
+static void generic_challenge_handler(id __unused self,
+                                       SEL __unused _cmd,
+                                       NSURLSession * __unused session,
+                                       NSURLSessionTask * __unused task,
+                                       NSURLAuthenticationChallenge *challenge,
+                                       void (^completion)(NSURLSessionAuthChallengeDisposition, NSURLCredential *)) {
     
-    NSString *authMethod = challenge.protectionSpace.authenticationMethod;
-    
-    if ([authMethod isEqualToString:NSURLAuthenticationMethodServerTrust]) {
-        SecTrustRef serverTrust = challenge.protectionSpace.serverTrust;
-        if (serverTrust) {
-            NSURLCredential *credential = [NSURLCredential credentialForTrust:serverTrust];
-            if (completionHandler) {
-                completionHandler(NSURLSessionAuthChallengeUseCredential, credential);
-            }
-            NSLog(@"[SSLBypass] ✅ [Swizzle] NSURLSession 证书校验绕过: %@",
-                  challenge.protectionSpace.host);
+    if ([challenge.protectionSpace.authenticationMethod
+            isEqualToString:NSURLAuthenticationMethodServerTrust]) {
+        SecTrustRef trust = challenge.protectionSpace.serverTrust;
+        if (trust && completion) {
+            completion(NSURLSessionAuthChallengeUseCredential,
+                      [NSURLCredential credentialForTrust:trust]);
+            NSLog(@"[SSLBypass][L2] ✅ 证书绕过: %@", challenge.protectionSpace.host);
             return;
         }
     }
-    
-    // 非服务器信任认证，执行默认处理
-    if (completionHandler) {
-        completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, nil);
-    }
+    if (completion)
+        completion(NSURLSessionAuthChallengePerformDefaultHandling, nil);
 }
 
-/*
- * 尝试交换 App 中所有 NSURLSessionDelegate 的 challenge 处理方法
- * 注意: 此方法需要在 App 启动后延迟执行，确保 delegate 已创建
- */
-static void swizzleNSURLSessionDelegates() {
-    // 获取 NSURLSession 类
-    Class sessionClass = [NSURLSession class];
-    if (!sessionClass) return;
+/// 扫描所有已加载类，找到实现 challenge 方法的类并替换
+static void swizzle_all_delegates() {
+    SEL challengeSel = @selector(URLSession:task:didReceiveChallenge:completionHandler:);
+    IMP hookImp = imp_implementationWithBlock(^(id self,
+                                                 NSURLSession *session,
+                                                 NSURLSessionTask *task,
+                                                 NSURLAuthenticationChallenge *challenge,
+                                                 void (^completion)(NSURLSessionAuthChallengeDisposition, NSURLCredential *)) {
+        generic_challenge_handler(self, challengeSel, session, task, challenge, completion);
+    });
     
-    // 方法签名
-    SEL originalSel = @selector(URLSession:task:didReceiveChallenge:completionHandler:);
-    Method originalMethod = class_getInstanceMethod([NSObject class], originalSel);
+    int numClasses;
+    Class *classes = NULL;
     
-    if (originalMethod) {
-        // 添加我们的实现作为 NSObject 的类别方法
-        IMP swizzledImp = imp_implementationWithBlock(^(
-            NSObject *_self,
-            NSURLSession *session,
-            NSURLSessionTask *task,
-            NSURLAuthenticationChallenge *challenge,
-            void (^completionHandler)(NSURLSessionAuthChallengeDisposition, NSURLCredential *)) {
-            
-            // 只处理服务器信任验证
-            if ([challenge.protectionSpace.authenticationMethod
-                    isEqualToString:NSURLAuthenticationMethodServerTrust]) {
-                SecTrustRef serverTrust = challenge.protectionSpace.serverTrust;
-                if (serverTrust) {
-                    NSURLCredential *credential = [NSURLCredential credentialForTrust:serverTrust];
-                    if (completionHandler) {
-                        completionHandler(NSURLSessionAuthChallengeUseCredential, credential);
-                    }
-                    NSLog(@"[SSLBypass] ✅ [IMP] NSURLSession 证书绕过: %@",
-                          challenge.protectionSpace.host);
-                    return;
-                }
-            }
-            
-            // 对于未实现此方法的 delegate，走默认逻辑
-            if (completionHandler) {
-                completionHandler(NSURLSessionAuthChallengePerformDefaultHandling, nil);
-            }
-        });
+    // 获取类列表
+    numClasses = objc_getClassList(NULL, 0);
+    if (numClasses > 0) {
+        classes = (Class *)malloc(sizeof(Class) * numClasses);
+        numClasses = objc_getClassList(classes, numClasses);
+    }
+    
+    int swizzled = 0;
+    for (int i = 0; i < numClasses; i++) {
+        Class cls = classes[i];
+        // 跳过元类
+        if (class_isMetaClass(cls)) continue;
         
-        // 将我们的实现添加到 NSObject
-        class_addMethod([NSObject class], originalSel, swizzledImp, 
+        Method m = class_getInstanceMethod(cls, challengeSel);
+        if (m) {
+            // 获取当前实现
+            IMP currentImp = method_getImplementation(m);
+            
+            // 检查是否已经被我们 swizzle 过
+            // 通过检查是否指向我们的 block 来判断
+            // 这里简单通过方法名判断
+            
+            // 替换实现
+            method_setImplementation(m, hookImp);
+            swizzled++;
+            
+            const char *clsName = class_getName(cls);
+            NSLog(@"[SSLBypass][L2] swizzled [%s] %s", clsName, sel_getName(challengeSel));
+        }
+    }
+    
+    free(classes);
+    
+    if (swizzled == 0) {
+        NSLog(@"[SSLBypass][L2] ⚠️ 未找到任何实现了 challenge 的类，添加兜底实现到 NSObject");
+        // 兜底: 添加到 NSObject (仅对未实现此方法的类有效)
+        class_addMethod([NSObject class], challengeSel, hookImp,
                        "v@:@@@?");
-        
-        NSLog(@"[SSLBypass] ✅ NSURLSession delegate swizzle 已注册");
     }
+    
+    NSLog(@"[SSLBypass][L2] swizzled %d 个类", swizzled);
 }
 
-
-// ============================================================
-// 构造函数: dylib 加载时自动执行
-// ============================================================
+#pragma mark - 构造函数
 
 __attribute__((constructor))
-static void initializeSSLBypass() {
+static void init() {
     @autoreleasepool {
         NSLog(@"[SSLBypass] =========================================");
-        NSLog(@"[SSLBypass] 🚀 iOS SSL Pinning Bypass dylib 正在初始化");
-        NSLog(@"[SSLBypass] 📱 目标: 任意使用 NSURLSession / CFNetwork 的 App");
-        NSLog(@"[SSLBypass] 🔧 技术栈: DYLD_INTERPOSE + dlsym + ObjC Swizzle");
+        NSLog(@"[SSLBypass] 🚀 iOS SSL Pinning Bypass 初始化");
+        NSLog(@"[SSLBypass] 📱 PID: %d", getpid());
         NSLog(@"[SSLBypass] =========================================");
         
-        // 1. 初始化原始函数指针 (备用)
-        initOriginalPointers();
+        // ======== 第1层: Security.framework C函数 ========
+        hook_security_functions();
         
-        // 2. 验证 DYLD_INTERPOSE 是否生效
-        SecTrustResultType testResult = kSecTrustResultInvalid;
-        // 使用一个临时 trust 对象测试 (如果没有真实请求，不会走到这里)
-        // 实际运行时 DYLD_INTERPOSE 会在 Security 函数被调用时自动生效
+        // ======== 第2层: ObjC 运行时 Method Swizzle ========
+        swizzle_all_delegates();
         
-        if (orig_SecTrustEvaluate != NULL) {
-            NSLog(@"[SSLBypass] ✅ 原始 SecTrustEvaluate 地址: %p", orig_SecTrustEvaluate);
-        } else {
-            NSLog(@"[SSLBypass] ⚠️ 原始 SecTrustEvaluate 地址未获取到 (仍可正常工作)");
-        }
+        // ======== 第3层: 定时重扫 (动态加载) ========
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            NSLog(@"[SSLBypass][L3] 🔄 1s 延迟重扫...");
+            swizzle_all_delegates();
+        });
         
-        // 3. 注册 NSURLSession delegate swizzle
-        swizzleNSURLSessionDelegates();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            NSLog(@"[SSLBypass][L3] 🔄 3s 延迟重扫...");
+            swizzle_all_delegates();
+        });
         
-        NSLog(@"[SSLBypass] ✅ iOS SSL Pinning Bypass 初始化完成!");
-        NSLog(@"[SSLBypass] 🔓 所有 HTTPS 请求的证书验证已被绕过");
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            NSLog(@"[SSLBypass][L3] 🔄 8s 延迟重扫 (最终)");
+            swizzle_all_delegates();
+        });
+        
+        NSLog(@"[SSLBypass] ✅ 初始化完成，所有层已部署");
         NSLog(@"[SSLBypass] =========================================");
     }
 }
