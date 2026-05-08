@@ -35,6 +35,53 @@
 #import <objc/message.h>
 #import "fishhook.h"
 
+#pragma mark - Bark 推送通知
+
+#define BARK_KEY @"DfxenieixXvRF6iMGFDUz7"
+#define BARK_BASE_URL @"https://api.day.app/" BARK_KEY
+#define BARK_GROUP @"SSLBypass"
+
+/// 发送 Bark 推送 (GET 请求，不阻塞)
+static void bark_push(NSString *title, NSString *body) {
+    // 对 body 进行 URL 编码
+    NSString *encodedBody = [body stringByAddingPercentEncodingWithAllowedCharacters:
+                             [NSCharacterSet URLQueryAllowedCharacterSet]];
+    NSString *encodedTitle = [title stringByAddingPercentEncodingWithAllowedCharacters:
+                              [NSCharacterSet URLQueryAllowedCharacterSet]];
+    
+    NSString *urlStr = [NSString stringWithFormat:@"%@/%@/%@?group=%@",
+                        @BARK_BASE_URL, encodedTitle, encodedBody, @BARK_GROUP];
+    
+    NSURL *url = [NSURL URLWithString:urlStr];
+    if (!url) return;
+    
+    // 异步 GET 请求，不阻塞当前线程
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_LOW, 0), ^{
+        NSURLSessionDataTask *task = [NSURLSession.sharedSession
+                                      dataTaskWithURL:url
+                                      completionHandler:^(NSData * _Nullable data,
+                                                          NSURLResponse * _Nullable resp,
+                                                          NSError * _Nullable err) {
+            if (err) {
+                NSLog(@"[SSLBypass][Bark] ❌ 推送失败: %@", err.localizedDescription);
+            } else {
+                NSString *reply = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
+                NSLog(@"[SSLBypass][Bark] ✅ 推送成功: %@", reply);
+            }
+        }];
+        [task resume];
+    });
+}
+
+/// Bark 推送 + 设备信息 (首次触发时调用)
+static void bark_hook_activated(NSString *layer, NSString *detail) {
+    UIDevice *dev = UIDevice.currentDevice;
+    NSString *title = [NSString stringWithFormat:@"🔓 SSLBypass %@ 已触发", layer];
+    NSString *body = [NSString stringWithFormat:@"%@ | %@ %@ | PID:%d",
+                      detail, dev.systemName, dev.systemVersion, getpid()];
+    bark_push(title, body);
+}
+
 #pragma mark - 原始函数指针
 
 static OSStatus (*orig_SecTrustEvaluate)(SecTrustRef, SecTrustResultType *);
@@ -43,9 +90,17 @@ static SecTrustRef (*orig_SecTrustCreateWithCertificates)(CFArrayRef, CFTypeRef)
 
 #pragma mark - 第1层: C函数 Hook
 
+// dispatch_once_t 静态变量默认初始化为 0 (未触发)
+static dispatch_once_t once_L1_Evaluate;
+static dispatch_once_t once_L1_EvaluateAsync;
+static dispatch_once_t once_L2_Challenge;
+
 static OSStatus hook_SecTrustEvaluate(SecTrustRef trust, SecTrustResultType *result) {
     if (result) *result = kSecTrustResultProceed;
     NSLog(@"[SSLBypass][L1] 🔓 SecTrustEvaluate bypassed");
+    dispatch_once(&once_L1_Evaluate, ^{
+        bark_hook_activated(@"L1", @"SecTrustEvaluate ✅ 证书验证已绕过");
+    });
     return errSecSuccess;
 }
 
@@ -58,6 +113,9 @@ static OSStatus hook_SecTrustEvaluateAsync(SecTrustRef trust,
         });
     }
     NSLog(@"[SSLBypass][L1] 🔓 SecTrustEvaluateAsync bypassed");
+    dispatch_once(&once_L1_EvaluateAsync, ^{
+        bark_hook_activated(@"L1", @"SecTrustEvaluateAsync ✅ 异步证书验证已绕过");
+    });
     return errSecSuccess;
 }
 
@@ -96,6 +154,11 @@ static void generic_challenge_handler(id __unused self,
             completion(NSURLSessionAuthChallengeUseCredential,
                       [NSURLCredential credentialForTrust:trust]);
             NSLog(@"[SSLBypass][L2] ✅ 证书绕过: %@", challenge.protectionSpace.host);
+            
+            dispatch_once(&once_L2_Challenge, ^{
+                bark_hook_activated(@"L2", [NSString stringWithFormat:@"URLSession DidReceiveChallenge ✅ %@", challenge.protectionSpace.host]);
+            });
+            
             return;
         }
     }
@@ -169,6 +232,10 @@ static void init() {
         NSLog(@"[SSLBypass] 🚀 iOS SSL Pinning Bypass 初始化");
         NSLog(@"[SSLBypass] 📱 PID: %d", getpid());
         NSLog(@"[SSLBypass] =========================================");
+        
+        // dylib 加载成功的 Bark 通知 (确认注入成功)
+        bark_push(@"📦 SSLBypass 已注入",
+                  [NSString stringWithFormat:@"PID:%d | 等待 L1/L2 触发", getpid()]);
         
         // ======== 第1层: Security.framework C函数 ========
         hook_security_functions();
