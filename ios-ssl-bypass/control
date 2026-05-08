@@ -1,0 +1,13 @@
+Package: com.sslbypass.ios
+Name: SSLBypass - iOS SSL Pinning Bypass
+Depends: mobilesubstrate (>= 0.9.5000)
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: 通用 iOS SSL Pinning 绕过 dylib
+  Hook Security.framework (SecTrustEvaluate / SecTrustEvaluateAsync)
+  和 NSURLSession 认证挑战，用于抓包调试。
+  灵感来源: 王者营地 Android Frida SSL Pinning Bypass
+Maintainer: Security Researcher
+Author: Security Researcher
+Section: Tweaks
+Tag: purpose::extension, compatible::ios14

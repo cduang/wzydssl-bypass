@@ -1,0 +1,297 @@
+# ============================================================
+# iOS SSL Pinning Bypass Dylib - Build & Release Pipeline
+#
+# 功能:
+#   - 每次 push (main) 时编译 dylib 并上传为 artifact
+#   - 推送 git tag (如 v1.0.0) 时自动创建 GitHub Release
+#     并将编译好的 dylib 上传为 release asset
+#   - 支持手动触发 (workflow_dispatch)
+#
+# 触发方式:
+#   1. git tag v1.0.0 && git push origin v1.0.0  → 自动 Release
+#   2. push 到 main 分支 → 仅编译 + artifact
+#   3. GitHub UI → Actions → 手动运行
+#
+# 编译产物:
+#   - SSLBypass.dylib          (arm64, 用于 arm64 设备)
+#   - SSLBypass-arm64e.dylib   (arm64e, 用于 A12+ 设备)
+#   - SSLBypass-universal.dylib (胖二进制, 同时包含 arm64 + arm64e)
+#   - SSLBypass.deb            (Theos deb 包, 越狱设备直接安装)
+# ============================================================
+
+name: Build & Release SSLBypass
+
+on:
+  # 推送标签时触发 Release (推荐使用: git tag v1.0.0 && git push origin v1.0.0)
+  push:
+    tags:
+      - 'v*'
+    branches:
+      - main
+      - master
+
+  # 手动触发
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: '编译类型'
+        required: true
+        default: 'release'
+        type: choice
+        options:
+          - release
+          - debug
+      target_arch:
+        description: '目标架构'
+        required: true
+        default: 'arm64'
+        type: choice
+        options:
+          - arm64
+          - arm64e
+          - universal
+
+# 权限: 需要写入 Releases
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  ###########################################################################
+  # Job 1: 编译 dylib
+  ###########################################################################
+  build:
+    name: Build SSLBypass.dylib
+    runs-on: macos-latest  # 需要 macOS 以使用 Xcode 工具链
+
+    strategy:
+      matrix:
+        arch: [arm64, arm64e]
+
+    steps:
+      # -------------------------------------------------------
+      # 1. 检出代码
+      # -------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -------------------------------------------------------
+      # 2. 显示 Xcode 版本 (调试用)
+      # -------------------------------------------------------
+      - name: Show Xcode version
+        run: |
+          xcodebuild -version
+          xcrun -sdk iphoneos --show-sdk-path
+          swift --version
+
+      # -------------------------------------------------------
+      # 3. 编译 SSLBypass.dylib (使用 standalone.mk)
+      # -------------------------------------------------------
+      - name: Build dylib (${{ matrix.arch }})
+        id: build
+        working-directory: ./ios-ssl-bypass
+        run: |
+          echo "::group::📦 编译 SSLBypass.dylib (${{ matrix.arch }})"
+
+          # 手动编译 (不使用 standalone.mk 的固定 arch，自己指定)
+          SDK_PATH=$(xcrun -sdk iphoneos --show-sdk-path)
+          MIN_IOS="14.0"
+
+          clang++ \
+            -arch ${{ matrix.arch }} \
+            -miphoneos-version-min=${MIN_IOS} \
+            -isysroot ${SDK_PATH} \
+            -fobjc-arc \
+            -O2 \
+            -Wall \
+            -Wextra \
+            -undefined dynamic_lookup \
+            -dynamiclib \
+            -install_name @executable_path/SSLBypass.dylib \
+            -Xlinker -dead_strip \
+            -framework Foundation \
+            -framework Security \
+            -framework CFNetwork \
+            -o SSLBypass-${{ matrix.arch }}.dylib \
+            SSLBypass.mm
+
+          echo "::endgroup::"
+
+      # -------------------------------------------------------
+      # 4. 验证编译产物
+      # -------------------------------------------------------
+      - name: Verify dylib
+        working-directory: ./ios-ssl-bypass
+        run: |
+          echo "::group::🔍 验证 dylib"
+
+          # 检查文件是否存在
+          ls -lh SSLBypass-${{ matrix.arch }}.dylib
+
+          # 检查架构
+          echo "架构信息:"
+          lipo -info SSLBypass-${{ matrix.arch }}.dylib || file SSLBypass-${{ matrix.arch }}.dylib
+
+          # 检查符号
+          echo "导出符号:"
+          nm -gU SSLBypass-${{ matrix.arch }}.dylib | head -20
+
+          echo "::endgroup::"
+
+      # -------------------------------------------------------
+      # 5. 上传单个架构的 dylib 为 artifact
+      # -------------------------------------------------------
+      - name: Upload dylib artifact (${{ matrix.arch }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: SSLBypass-${{ matrix.arch }}
+          path: ./ios-ssl-bypass/SSLBypass-${{ matrix.arch }}.dylib
+          if-no-files-found: error
+
+  ###########################################################################
+  # Job 2: 创建通用 (universal) 二进制
+  ###########################################################################
+  universal:
+    name: Create Universal Binary
+    needs: [build]
+    runs-on: macos-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+
+      - name: Create universal binary with lipo
+        run: |
+          echo "::group::📦 创建 Universal Binary"
+
+          ls -R ./artifacts/
+
+          # 使用 lipo 合并为胖二进制
+          lipo -create \
+            ./artifacts/SSLBypass-arm64/SSLBypass-arm64.dylib \
+            ./artifacts/SSLBypass-arm64e/SSLBypass-arm64e.dylib \
+            -output ./SSLBypass-universal.dylib
+
+          # 验证
+          echo "Universal 二进制信息:"
+          lipo -info ./SSLBypass-universal.dylib
+          ls -lh ./SSLBypass-universal.dylib
+
+          echo "::endgroup::"
+
+      # 也复制一份单架构的为了方便
+      - name: Copy single-arch dylibs
+        run: |
+          cp ./artifacts/SSLBypass-arm64/SSLBypass-arm64.dylib ./SSLBypass.dylib
+
+      - name: Upload universal binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: SSLBypass-universal
+          path: |
+            ./SSLBypass-universal.dylib
+            ./SSLBypass.dylib
+          if-no-files-found: error
+
+  ###########################################################################
+  # Job 3: 发布 Release (仅在推送 tag 时执行)
+  ###########################################################################
+  release:
+    name: Create GitHub Release
+    needs: [universal]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest  # release 操作不需要 macOS
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./release-artifacts
+
+      - name: Prepare release assets
+        run: |
+          echo "::group::📦 整理 Release 产物"
+          mkdir -p ./release
+
+          # 复制 dylib 到发布目录
+          cp ./release-artifacts/SSLBypass-arm64/SSLBypass-arm64.dylib ./release/
+          cp ./release-artifacts/SSLBypass-arm64e/SSLBypass-arm64e.dylib ./release/
+          cp ./release-artifacts/SSLBypass-universal/SSLBypass-universal.dylib ./release/
+          cp ./release-artifacts/SSLBypass-universal/SSLBypass.dylib ./release/
+
+          # 复制源代码包（手动）
+          cp ./ios-ssl-bypass/SSLBypass.mm ./release/
+          cp ./ios-ssl-bypass/Tweak.xm ./release/
+
+          # 生成校验和
+          cd ./release
+          echo "=== SHA256 Checksums ===" > checksums.txt
+          sha256sum * >> checksums.txt
+          cat checksums.txt
+
+          echo "::endgroup::"
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          echo "::group::📝 生成 Release Notes"
+          cat > ./release-notes.md << 'EOF'
+# iOS SSL Pinning Bypass Dylib
+
+## 📦 下载
+
+| 文件 | 架构 | 说明 |
+|------|------|------|
+| `SSLBypass.dylib` | arm64 | iPhone 5s - X (A7-A11) |
+| `SSLBypass-arm64e.dylib` | arm64e | iPhone XS 及以上 (A12+) |
+| `SSLBypass-universal.dylib` | arm64 + arm64e | 通用胖二进制 |
+
+## 🔧 使用方法
+
+```bash
+# 1. 解压王者营地 IPA
+unzip 王者营地.ipa -d Payload
+
+# 2. 注入 dylib
+cp SSLBypass.dylib Payload/王者营地.app/
+insert_dylib --all-yes @executable_path/SSLBypass.dylib \\
+    Payload/王者营地.app/王者营地 \\
+    Payload/王者营地.app/王者营地_patched
+
+# 3. 重签名并安装
+```
+
+## 🔒 功能
+
+- Hook `SecTrustEvaluate` / `SecTrustEvaluateAsync` 绕过证书验证
+- Hook `NSURLSession` delegate 处理认证挑战
+- 兼容王者营地 `kohcamp.qq.com` 接口
+- iOS 14.0+ 全版本兼容
+
+> ⚠️ 仅供学习研究使用
+EOF
+
+          echo "release_notes_path=./release-notes.md" >> $GITHUB_OUTPUT
+          echo "::endgroup::"
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "SSLBypass v${{ github.ref_name }}"
+          body_path: ./release-notes.md
+          draft: false
+          prerelease: ${{ contains(github.ref_name, 'beta') || contains(github.ref_name, 'alpha') }}
+          files: |
+            ./release/SSLBypass.dylib
+            ./release/SSLBypass-arm64.dylib
+            ./release/SSLBypass-arm64e.dylib
+            ./release/SSLBypass-universal.dylib
+            ./release/checksums.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
