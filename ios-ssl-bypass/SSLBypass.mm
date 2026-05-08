@@ -24,13 +24,14 @@
  *           -fobjc-arc -O2 \
  *           -dynamiclib \
  *           -install_name @executable_path/SSLBypass.dylib \
- *           -framework Foundation -framework Security \
+ *           -framework Foundation -framework Security -framework UIKit \
  *           -o SSLBypass.dylib \
  *           SSLBypass.mm fishhook.c
  */
 
 #import <Foundation/Foundation.h>
 #import <Security/Security.h>
+#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import "fishhook.h"
@@ -49,8 +50,9 @@ static void bark_push(NSString *title, NSString *body) {
     NSString *encodedTitle = [title stringByAddingPercentEncodingWithAllowedCharacters:
                               [NSCharacterSet URLQueryAllowedCharacterSet]];
     
+    // 宏已包含 @""，直接使用宏名即可
     NSString *urlStr = [NSString stringWithFormat:@"%@/%@/%@?group=%@",
-                        @BARK_BASE_URL, encodedTitle, encodedBody, @BARK_GROUP];
+                        BARK_BASE_URL, encodedTitle, encodedBody, BARK_GROUP];
     
     NSURL *url = [NSURL URLWithString:urlStr];
     if (!url) return;
@@ -127,10 +129,11 @@ static SecTrustRef hook_SecTrustCreateWithCertificates(CFArrayRef certs, CFTypeR
 
 /// 注册 fishhook，替换 Security.framework 符号指针
 static void hook_security_functions() {
+    // C++ 需要显式 cast 函数指针 → void*
     struct fishhook_rebinding rebindings[] = {
-        {"SecTrustEvaluate",             hook_SecTrustEvaluate,             (void **)&orig_SecTrustEvaluate},
-        {"SecTrustEvaluateAsync",        hook_SecTrustEvaluateAsync,        (void **)&orig_SecTrustEvaluateAsync},
-        {"SecTrustCreateWithCertificates", hook_SecTrustCreateWithCertificates, (void **)&orig_SecTrustCreateWithCertificates},
+        {"SecTrustEvaluate",             (void *)hook_SecTrustEvaluate,             (void **)&orig_SecTrustEvaluate},
+        {"SecTrustEvaluateAsync",        (void *)hook_SecTrustEvaluateAsync,        (void **)&orig_SecTrustEvaluateAsync},
+        {"SecTrustCreateWithCertificates", (void *)hook_SecTrustCreateWithCertificates, (void **)&orig_SecTrustCreateWithCertificates},
     };
     
     int r = fishhook_rebind_symbols(rebindings, sizeof(rebindings)/sizeof(rebindings[0]));
@@ -195,14 +198,7 @@ static void swizzle_all_delegates() {
         
         Method m = class_getInstanceMethod(cls, challengeSel);
         if (m) {
-            // 获取当前实现
-            IMP currentImp = method_getImplementation(m);
-            
-            // 检查是否已经被我们 swizzle 过
-            // 通过检查是否指向我们的 block 来判断
-            // 这里简单通过方法名判断
-            
-            // 替换实现
+            // 替换实现为我们的通用 handler
             method_setImplementation(m, hookImp);
             swizzled++;
             

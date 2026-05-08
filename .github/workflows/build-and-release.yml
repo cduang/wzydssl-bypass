@@ -105,12 +105,14 @@ jobs:
             -O2 \
             -Wall \
             -Wextra \
+            -Wno-unused-parameter \
             -undefined dynamic_lookup \
             -dynamiclib \
             -install_name @executable_path/SSLBypass.dylib \
             -Xlinker -dead_strip \
             -framework Foundation \
             -framework Security \
+            -framework UIKit \
             -o SSLBypass-${{ matrix.arch }}.dylib \
             SSLBypass.mm fishhook.c
 

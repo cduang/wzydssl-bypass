@@ -38,7 +38,8 @@ LDFLAGS = -arch $(ARCHS) \
           -Xlinker -dead_strip \
           -framework Foundation \
           -framework Security \
-          -framework CFNetwork
+          -framework CFNetwork \
+          -framework UIKit
 
 # 源文件
 SOURCES = SSLBypass.mm fishhook.c
